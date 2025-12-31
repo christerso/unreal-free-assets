@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -25,17 +26,23 @@ import (
 )
 
 const (
-	fabFreeURL      = "https://www.fab.com/search?price=free&sort=relevancy"
-	unrealFreeURL   = "https://www.unrealengine.com/marketplace/en-US/assets?tag=4910"
 	unrealSourceURL = "https://unrealsource.com/dispatch/"
 	checkInterval   = 1 * time.Hour
 	dataFileName    = "seen_assets.json"
+)
+
+// Asset categories
+const (
+	CategoryFree   = "free"
+	CategoryLatest = "latest"
 )
 
 type Asset struct {
 	Title     string    `json:"title"`
 	URL       string    `json:"url"`
 	Price     string    `json:"price"`
+	Category  string    `json:"category"` // "free" or "latest"
+	ExpiresAt string    `json:"expires_at,omitempty"`
 	FirstSeen time.Time `json:"first_seen"`
 }
 
@@ -45,15 +52,22 @@ type AppData struct {
 }
 
 var (
-	appData      AppData
-	dataFile     string
-	dataDir      string
-	httpClient   *http.Client
-	fyneApp      fyne.App
-	mainWindow   fyne.Window
-	assetsList   *widget.List
-	sortedAssets []Asset
-	statusLabel  *widget.Label
+	appData           AppData
+	dataFile          string
+	dataDir           string
+	httpClient        *http.Client
+	fyneApp           fyne.App
+	mainWindow        fyne.Window
+	freeList          *widget.List
+	latestList        *widget.List
+	freeAssets        []Asset
+	latestAssets      []Asset
+	filteredFree      []Asset
+	filteredLatest    []Asset
+	statusLabel       *widget.Label
+	tabs              *container.AppTabs
+	searchEntry       *widget.Entry
+	currentSearchTerm string
 )
 
 // Custom dark theme with Unreal orange accent
@@ -92,7 +106,6 @@ func (t *unrealTheme) Size(name fyne.ThemeSizeName) float32 {
 }
 
 func main() {
-	// Setup paths
 	appDataDir, _ := os.UserConfigDir()
 	if appDataDir == "" {
 		appDataDir = "."
@@ -105,54 +118,50 @@ func main() {
 	loadData()
 	initIcon()
 
-	// Create Fyne app
 	fyneApp = app.New()
 	fyneApp.Settings().SetTheme(&unrealTheme{})
 
-	// Setup system tray
 	if desk, ok := fyneApp.(desktop.App); ok {
 		setupSystemTray(desk)
 	}
 
-	// Create main window (hidden initially)
-	mainWindow = fyneApp.NewWindow("Free Unreal Assets")
-	mainWindow.Resize(fyne.NewSize(750, 550))
+	mainWindow = fyneApp.NewWindow("Unreal Assets Monitor")
+	mainWindow.Resize(fyne.NewSize(800, 600))
+	if iconData != nil && len(iconData) > 0 {
+		mainWindow.SetIcon(fyne.NewStaticResource("icon.png", iconData))
+	}
 	mainWindow.SetCloseIntercept(func() {
 		mainWindow.Hide()
 	})
 
 	buildMainUI()
 
-	// Start background checker
 	go backgroundChecker()
 
-	// Initial check after delay
 	go func() {
 		time.Sleep(3 * time.Second)
-		checkForFreeAssets()
+		checkForAssets()
 	}()
 
-	// Run (window stays hidden, systray active)
 	fyneApp.Run()
 }
 
 func setupSystemTray(desk desktop.App) {
-	// Create tray menu
-	menu := fyne.NewMenu("Unreal Free Assets",
-		fyne.NewMenuItem("View Found Assets", func() {
-			refreshAssetsList()
+	menu := fyne.NewMenu("Unreal Assets Monitor",
+		fyne.NewMenuItem("View Assets", func() {
+			refreshAssetLists()
 			mainWindow.Show()
 			mainWindow.RequestFocus()
 		}),
 		fyne.NewMenuItem("Check Now", func() {
-			go checkForFreeAssets()
+			go checkForAssets()
 		}),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Open FAB Marketplace", func() {
 			openBrowser("https://www.fab.com/search?price=free")
 		}),
-		fyne.NewMenuItem("Open Unreal Source", func() {
-			openBrowser("https://unrealsource.com/dispatch/")
+		fyne.NewMenuItem("Buy Me a Coffee", func() {
+			openBrowser("https://buymeacoffee.com/qvark")
 		}),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Quit", func() {
@@ -169,78 +178,68 @@ func setupSystemTray(desk desktop.App) {
 
 func buildMainUI() {
 	// Header
-	title := canvas.NewText("Free Unreal Assets", color.RGBA{245, 130, 32, 255})
+	title := canvas.NewText("Unreal Assets Monitor", color.RGBA{245, 130, 32, 255})
 	title.TextSize = 26
 	title.TextStyle = fyne.TextStyle{Bold: true}
 
 	statusLabel = widget.NewLabel("Loading...")
 	statusLabel.Alignment = fyne.TextAlignCenter
 
+	// Search entry
+	searchEntry = widget.NewEntry()
+	searchEntry.SetPlaceHolder("Search assets...")
+	searchEntry.OnChanged = func(s string) {
+		currentSearchTerm = strings.ToLower(strings.TrimSpace(s))
+		applySearchFilter()
+	}
+
+	// Clear search button
+	clearSearchBtn := widget.NewButton("Clear", func() {
+		searchEntry.SetText("")
+		currentSearchTerm = ""
+		applySearchFilter()
+	})
+
+	searchBox := container.NewBorder(nil, nil, nil, clearSearchBtn, searchEntry)
+
 	header := container.NewVBox(
 		container.NewCenter(title),
 		statusLabel,
 		widget.NewSeparator(),
+		searchBox,
 	)
 
-	// Assets list
-	sortedAssets = getSortedAssets()
+	// Create lists - use filtered lists for display
+	freeAssets, latestAssets = getSortedAssets()
+	filteredFree = freeAssets
+	filteredLatest = latestAssets
 
-	assetsList = widget.NewList(
-		func() int { return len(sortedAssets) },
-		func() fyne.CanvasObject {
-			titleLabel := widget.NewLabel("Asset Title Here")
-			titleLabel.TextStyle = fyne.TextStyle{Bold: true}
-			titleLabel.Wrapping = fyne.TextTruncate
-
-			dateLabel := widget.NewLabel("Found: date")
-			dateLabel.TextStyle = fyne.TextStyle{Italic: true}
-
-			openBtn := widget.NewButton("Open →", func() {})
-			openBtn.Importance = widget.HighImportance
-
-			left := container.NewVBox(titleLabel, dateLabel)
-			return container.NewBorder(nil, nil, nil, openBtn, left)
-		},
-		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			if id >= len(sortedAssets) {
-				return
-			}
-			asset := sortedAssets[id]
-
-			c := obj.(*fyne.Container)
-			left := c.Objects[0].(*fyne.Container)
-			titleLabel := left.Objects[0].(*widget.Label)
-			dateLabel := left.Objects[1].(*widget.Label)
-			openBtn := c.Objects[1].(*widget.Button)
-
-			displayTitle := asset.Title
-			if len(displayTitle) > 70 {
-				displayTitle = displayTitle[:67] + "..."
-			}
-			titleLabel.SetText(displayTitle)
-
-			isNew := asset.FirstSeen.After(time.Now().Truncate(24 * time.Hour))
-			dateText := fmt.Sprintf("Found: %s", asset.FirstSeen.Format("Jan 2, 2006 15:04"))
-			if isNew {
-				dateText = "🆕 " + dateText
-			}
-			dateLabel.SetText(dateText)
-
-			url := asset.URL
-			openBtn.OnTapped = func() { openBrowser(url) }
-		},
+	// FREE tab
+	freeList = createAssetList(&filteredFree)
+	freeTab := container.NewBorder(
+		createTabHeader("🎁 FREE Assets", "Claim these before they expire!", len(filteredFree)),
+		nil, nil, nil,
+		freeList,
 	)
 
-	assetsList.OnSelected = func(id widget.ListItemID) {
-		if id < len(sortedAssets) {
-			openBrowser(sortedAssets[id].URL)
-		}
-		assetsList.Unselect(id)
-	}
+	// LATEST tab
+	latestList = createAssetList(&filteredLatest)
+	latestTab := container.NewBorder(
+		createTabHeader("🆕 Latest News", "Unreal & FAB marketplace news", len(filteredLatest)),
+		nil, nil, nil,
+		latestList,
+	)
+
+	// Tabs
+	tabs = container.NewAppTabs(
+		container.NewTabItem(fmt.Sprintf("Free (%d)", len(filteredFree)), freeTab),
+		container.NewTabItem(fmt.Sprintf("Latest (%d)", len(filteredLatest)), latestTab),
+	)
+	tabs.SetTabLocation(container.TabLocationTop)
 
 	// Footer buttons
 	checkBtn := widget.NewButton("🔄 Check Now", func() {
-		go checkForFreeAssets()
+		go checkForAssets()
 	})
 
 	fabBtn := widget.NewButton("🌐 Open FAB", func() {
@@ -248,25 +247,144 @@ func buildMainUI() {
 	})
 	fabBtn.Importance = widget.HighImportance
 
-	clearBtn := widget.NewButton("🗑 Clear History", func() {
+	clearBtn := widget.NewButton("🗑 Clear All", func() {
 		clearHistory()
-		refreshAssetsList()
+		refreshAssetLists()
+	})
+
+	coffeeBtn := widget.NewButton("☕ Buy Me a Coffee", func() {
+		openBrowser("https://buymeacoffee.com/qvark")
 	})
 
 	footer := container.NewVBox(
 		widget.NewSeparator(),
-		container.NewCenter(container.NewHBox(checkBtn, fabBtn, clearBtn)),
+		container.NewCenter(container.NewHBox(checkBtn, fabBtn, clearBtn, coffeeBtn)),
 	)
 
-	mainWindow.SetContent(container.NewBorder(header, footer, nil, nil, assetsList))
+	mainWindow.SetContent(container.NewBorder(header, footer, nil, nil, tabs))
 	updateStatusLabel()
 }
 
-func refreshAssetsList() {
-	sortedAssets = getSortedAssets()
-	if assetsList != nil {
-		assetsList.Refresh()
+func applySearchFilter() {
+	if currentSearchTerm == "" {
+		// No filter - show all
+		filteredFree = freeAssets
+		filteredLatest = latestAssets
+	} else {
+		// Filter by search term
+		filteredFree = nil
+		for _, a := range freeAssets {
+			if strings.Contains(strings.ToLower(a.Title), currentSearchTerm) ||
+				strings.Contains(strings.ToLower(a.URL), currentSearchTerm) {
+				filteredFree = append(filteredFree, a)
+			}
+		}
+
+		filteredLatest = nil
+		for _, a := range latestAssets {
+			if strings.Contains(strings.ToLower(a.Title), currentSearchTerm) ||
+				strings.Contains(strings.ToLower(a.URL), currentSearchTerm) {
+				filteredLatest = append(filteredLatest, a)
+			}
+		}
 	}
+
+	// Refresh lists
+	if freeList != nil {
+		freeList.Refresh()
+	}
+	if latestList != nil {
+		latestList.Refresh()
+	}
+
+	// Update tab counts
+	if tabs != nil {
+		tabs.Items[0].Text = fmt.Sprintf("Free (%d)", len(filteredFree))
+		tabs.Items[1].Text = fmt.Sprintf("Latest (%d)", len(filteredLatest))
+		tabs.Refresh()
+	}
+}
+
+func createTabHeader(title, subtitle string, count int) fyne.CanvasObject {
+	titleText := canvas.NewText(title, color.RGBA{245, 130, 32, 255})
+	titleText.TextSize = 18
+	titleText.TextStyle = fyne.TextStyle{Bold: true}
+
+	subtitleText := widget.NewLabel(subtitle)
+	subtitleText.Alignment = fyne.TextAlignCenter
+
+	return container.NewVBox(
+		container.NewCenter(titleText),
+		subtitleText,
+		widget.NewSeparator(),
+	)
+}
+
+func createAssetList(assets *[]Asset) *widget.List {
+	list := widget.NewList(
+		func() int { return len(*assets) },
+		func() fyne.CanvasObject {
+			titleLabel := widget.NewLabel("Asset Title Here")
+			titleLabel.TextStyle = fyne.TextStyle{Bold: true}
+			titleLabel.Wrapping = fyne.TextTruncate
+
+			infoLabel := widget.NewLabel("Info")
+			infoLabel.TextStyle = fyne.TextStyle{Italic: true}
+
+			openBtn := widget.NewButton("Open →", func() {})
+			openBtn.Importance = widget.HighImportance
+
+			left := container.NewVBox(titleLabel, infoLabel)
+			return container.NewBorder(nil, nil, nil, openBtn, left)
+		},
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			if id >= len(*assets) {
+				return
+			}
+			asset := (*assets)[id]
+
+			c := obj.(*fyne.Container)
+			left := c.Objects[0].(*fyne.Container)
+			titleLabel := left.Objects[0].(*widget.Label)
+			infoLabel := left.Objects[1].(*widget.Label)
+			openBtn := c.Objects[1].(*widget.Button)
+
+			displayTitle := asset.Title
+			if len(displayTitle) > 60 {
+				displayTitle = displayTitle[:57] + "..."
+			}
+			titleLabel.SetText(displayTitle)
+
+			// Show category-specific info
+			if asset.Category == CategoryFree {
+				if asset.ExpiresAt != "" {
+					infoLabel.SetText("⏰ " + asset.ExpiresAt)
+				} else {
+					infoLabel.SetText("🎁 FREE - Claim now!")
+				}
+			} else {
+				infoLabel.SetText("💰 " + asset.Price + " • Found: " + asset.FirstSeen.Format("Jan 2"))
+			}
+
+			url := asset.URL
+			openBtn.OnTapped = func() { openBrowser(url) }
+		},
+	)
+
+	list.OnSelected = func(id widget.ListItemID) {
+		if id < len(*assets) {
+			openBrowser((*assets)[id].URL)
+		}
+		list.Unselect(id)
+	}
+
+	return list
+}
+
+func refreshAssetLists() {
+	freeAssets, latestAssets = getSortedAssets()
+	// Re-apply current search filter
+	applySearchFilter()
 	updateStatusLabel()
 }
 
@@ -278,194 +396,254 @@ func updateStatusLabel() {
 	if !appData.LastCheck.IsZero() {
 		checkTime = appData.LastCheck.Format("Jan 2, 15:04")
 	}
-	statusLabel.SetText(fmt.Sprintf("%d assets found • Last check: %s", len(sortedAssets), checkTime))
+	total := len(freeAssets) + len(latestAssets)
+	statusLabel.SetText(fmt.Sprintf("%d free • %d latest • Last check: %s", len(freeAssets), len(latestAssets), checkTime))
+	_ = total
 }
 
-func getSortedAssets() []Asset {
-	assets := make([]Asset, 0, len(appData.SeenAssets))
+func getSortedAssets() ([]Asset, []Asset) {
+	var free, latest []Asset
 	for _, asset := range appData.SeenAssets {
-		assets = append(assets, asset)
+		if asset.Category == CategoryFree {
+			free = append(free, asset)
+		} else {
+			latest = append(latest, asset)
+		}
 	}
-	sort.Slice(assets, func(i, j int) bool {
-		return assets[i].FirstSeen.After(assets[j].FirstSeen)
+	sort.Slice(free, func(i, j int) bool {
+		return free[i].FirstSeen.After(free[j].FirstSeen)
 	})
-	return assets
+	sort.Slice(latest, func(i, j int) bool {
+		return latest[i].FirstSeen.After(latest[j].FirstSeen)
+	})
+	return free, latest
 }
 
 func backgroundChecker() {
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 	for range ticker.C {
-		checkForFreeAssets()
+		checkForAssets()
 	}
 }
 
-func checkForFreeAssets() {
-	log.Println("Checking for free assets...")
-	newAssets := []Asset{}
+func checkForAssets() {
+	log.Println("Checking for assets...")
+	newFreeAssets := []Asset{}
+	newLatestAssets := []Asset{}
 
-	// Check FAB
-	if assets, err := scrapeFabFreeAssets(); err != nil {
-		log.Printf("FAB error: %v", err)
-	} else {
-		for _, a := range assets {
-			if _, seen := appData.SeenAssets[a.URL]; !seen {
-				a.FirstSeen = time.Now()
-				appData.SeenAssets[a.URL] = a
-				newAssets = append(newAssets, a)
-			}
-		}
-	}
-
-	// Check Unreal Marketplace
-	if assets, err := scrapeUnrealFreeAssets(); err != nil {
-		log.Printf("Unreal error: %v", err)
-	} else {
-		for _, a := range assets {
-			if _, seen := appData.SeenAssets[a.URL]; !seen {
-				a.FirstSeen = time.Now()
-				appData.SeenAssets[a.URL] = a
-				newAssets = append(newAssets, a)
-			}
-		}
-	}
-
-	// Check Unreal Source
-	if assets, err := scrapeUnrealSource(); err != nil {
+	// Scrape Unreal Source for FREE and Latest assets
+	free, latest, err := scrapeUnrealSource()
+	if err != nil {
 		log.Printf("Unreal Source error: %v", err)
 	} else {
-		for _, a := range assets {
+		for _, a := range free {
 			if _, seen := appData.SeenAssets[a.URL]; !seen {
 				a.FirstSeen = time.Now()
 				appData.SeenAssets[a.URL] = a
-				newAssets = append(newAssets, a)
+				newFreeAssets = append(newFreeAssets, a)
+			}
+		}
+		for _, a := range latest {
+			if _, seen := appData.SeenAssets[a.URL]; !seen {
+				a.FirstSeen = time.Now()
+				appData.SeenAssets[a.URL] = a
+				newLatestAssets = append(newLatestAssets, a)
 			}
 		}
 	}
 
 	appData.LastCheck = time.Now()
 	saveData()
-	refreshAssetsList()
+	refreshAssetLists()
 
-	if len(newAssets) > 0 {
-		notifyNewAssets(newAssets)
+	if len(newFreeAssets) > 0 {
+		notifyNewAssets(newFreeAssets, true)
 	}
-	log.Printf("Check complete. Found %d new assets.", len(newAssets))
+	if len(newLatestAssets) > 0 {
+		notifyNewAssets(newLatestAssets, false)
+	}
+
+	log.Printf("Check complete. Found %d new free, %d new latest.", len(newFreeAssets), len(newLatestAssets))
 }
 
-func scrapeFabFreeAssets() ([]Asset, error) {
-	req, _ := http.NewRequest("GET", fabFreeURL, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+func scrapeUnrealSource() ([]Asset, []Asset, error) {
+	var freeAssets []Asset
+	var latestAssets []Asset
+	seenURLs := make(map[string]bool)
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var assets []Asset
-	doc.Find("a[href*='/listings/']").Each(func(i int, s *goquery.Selection) {
-		href, _ := s.Attr("href")
-		title := strings.TrimSpace(s.Text())
-		if title == "" {
-			title = s.Find("img").AttrOr("alt", "Unknown")
-		}
-		if href != "" && title != "" {
-			if !strings.HasPrefix(href, "http") {
-				href = "https://www.fab.com" + href
-			}
-			assets = append(assets, Asset{Title: title, URL: href, Price: "Free"})
-		}
-	})
-	return assets, nil
-}
-
-func scrapeUnrealFreeAssets() ([]Asset, error) {
-	req, _ := http.NewRequest("GET", unrealFreeURL, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var assets []Asset
-	doc.Find("a[href*='/product/']").Each(func(i int, s *goquery.Selection) {
-		href, _ := s.Attr("href")
-		title := strings.TrimSpace(s.Text())
-		if title == "" {
-			title = s.Find("img").AttrOr("alt", "")
-		}
-		if href != "" && title != "" {
-			if !strings.HasPrefix(href, "http") {
-				href = "https://www.unrealengine.com" + href
-			}
-			assets = append(assets, Asset{Title: title, URL: href, Price: "Free"})
-		}
-	})
-	return assets, nil
-}
-
-func scrapeUnrealSource() ([]Asset, error) {
+	// First, get the dispatch page to find links to free asset announcements
 	req, _ := http.NewRequest("GET", unrealSourceURL, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	var assets []Asset
-	doc.Find("a[href*='fab.com/listings']").Each(func(i int, s *goquery.Selection) {
-		href, _ := s.Attr("href")
-		title := strings.TrimSpace(s.Text())
-		if title == "" {
-			title = s.Parent().Text()
+	// Find links to "free fab assets" detail pages
+	// These are dispatch articles with URLs like /d/free-fab-assets-*
+	freeDispatchLinks := []string{}
+	doc.Find("a[href*='/d/free-fab-assets']").Each(func(i int, link *goquery.Selection) {
+		href, exists := link.Attr("href")
+		if exists && !strings.HasPrefix(href, "http") {
+			href = "https://unrealsource.com" + href
 		}
-		if len(title) > 100 {
-			title = title[:100]
-		}
-		if href != "" && title != "" {
-			assets = append(assets, Asset{Title: title, URL: href, Price: "Free"})
+		if exists && href != "" {
+			// Dedupe
+			for _, existing := range freeDispatchLinks {
+				if existing == href {
+					return
+				}
+			}
+			freeDispatchLinks = append(freeDispatchLinks, href)
 		}
 	})
-	return assets, nil
+
+	// Fetch each free assets detail page (usually just 1 - the current batch)
+	// Only process the first one (most recent)
+	if len(freeDispatchLinks) > 0 {
+		free := scrapeFreeAssetsPage(freeDispatchLinks[0], seenURLs)
+		freeAssets = append(freeAssets, free...)
+	}
+
+	// Collect other dispatch links as "latest" news
+	doc.Find("a[href*='/d/']").Each(func(i int, link *goquery.Selection) {
+		href, exists := link.Attr("href")
+		if !exists {
+			return
+		}
+		// Skip free-fab-assets pages (already processed)
+		if strings.Contains(href, "free-fab-assets") {
+			return
+		}
+		if !strings.HasPrefix(href, "http") {
+			href = "https://unrealsource.com" + href
+		}
+		if seenURLs[href] {
+			return
+		}
+
+		// Try to get title from the link text, or extract from URL if it's a timestamp
+		title := strings.TrimSpace(link.Text())
+
+		// If title looks like a relative time, extract from URL instead
+		if title == "" || len(title) < 5 || strings.Contains(title, "ago") ||
+		   strings.Contains(title, "month") || strings.Contains(title, "year") ||
+		   strings.Contains(title, "week") || strings.Contains(title, "day") {
+			// Extract title from URL: /d/some-article-title/ -> Some Article Title
+			parts := strings.Split(href, "/d/")
+			if len(parts) > 1 {
+				slug := strings.TrimSuffix(parts[1], "/")
+				slug = strings.ReplaceAll(slug, "-", " ")
+				// Capitalize first letter of each word
+				words := strings.Fields(slug)
+				for i, w := range words {
+					if len(w) > 0 {
+						words[i] = strings.ToUpper(string(w[0])) + w[1:]
+					}
+				}
+				title = strings.Join(words, " ")
+			}
+		}
+
+		if title == "" || len(title) < 5 {
+			return
+		}
+		if len(title) > 80 {
+			title = title[:77] + "..."
+		}
+
+		seenURLs[href] = true
+		latestAssets = append(latestAssets, Asset{
+			Title:    title,
+			URL:      href,
+			Price:    "News",
+			Category: CategoryLatest,
+		})
+	})
+
+	log.Printf("Scraped: %d free assets, %d latest assets", len(freeAssets), len(latestAssets))
+	return freeAssets, latestAssets, nil
 }
 
-func notifyNewAssets(assets []Asset) {
-	msg := fmt.Sprintf("%d new free assets!", len(assets))
+func scrapeFreeAssetsPage(url string, seenURLs map[string]bool) []Asset {
+	var assets []Asset
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		log.Printf("Error fetching free assets page: %v", err)
+		return assets
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		log.Printf("Free assets page returned status %d", resp.StatusCode)
+		return assets
+	}
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		log.Printf("Error parsing free assets page: %v", err)
+		return assets
+	}
+
+	// Extract expiration date from page text
+	expiresPattern := regexp.MustCompile(`(?i)(?:until|before).*?(\w+\s+\d+,?\s*202\d)`)
+	expiresAt := ""
+	pageText := doc.Text()
+	if matches := expiresPattern.FindStringSubmatch(pageText); len(matches) > 1 {
+		expiresAt = "Free until " + matches[1]
+	}
+
+	// Find all fab.com/listings links on this page - these are the free assets
+	doc.Find("a[href*='fab.com/listings']").Each(func(i int, link *goquery.Selection) {
+		href, exists := link.Attr("href")
+		if !exists || seenURLs[href] {
+			return
+		}
+
+		title := strings.TrimSpace(link.Text())
+		if title == "" || len(title) < 3 {
+			return
+		}
+
+		seenURLs[href] = true
+		assets = append(assets, Asset{
+			Title:     title,
+			URL:       href,
+			Price:     "FREE",
+			Category:  CategoryFree,
+			ExpiresAt: expiresAt,
+		})
+	})
+
+	log.Printf("Found %d free assets on detail page", len(assets))
+	return assets
+}
+
+func notifyNewAssets(assets []Asset, isFree bool) {
+	title := "New Assets Found!"
+	if isFree {
+		title = "🎁 New FREE Assets!"
+	}
+
+	msg := fmt.Sprintf("%d new assets", len(assets))
 	if len(assets) == 1 {
-		msg = "New: " + assets[0].Title
+		msg = assets[0].Title
 	} else if len(assets) <= 3 {
 		var titles []string
 		for _, a := range assets {
@@ -475,8 +653,8 @@ func notifyNewAssets(assets []Asset) {
 	}
 
 	notification := toast.Notification{
-		AppID:   "Unreal Free Assets",
-		Title:   "New Free Assets Found!",
+		AppID:   "Unreal Assets Monitor",
+		Title:   title,
 		Message: msg,
 	}
 	notification.Push()

@@ -3,7 +3,7 @@
 
 #define MyAppName "Unreal Free Assets Monitor"
 #define MyAppVersion "1.0.0"
-#define MyAppPublisher "Chris"
+#define MyAppPublisher "Christer Söderlund"
 #define MyAppExeName "unreal-free-assets.exe"
 #define MyAppAssocName MyAppName + " File"
 #define MyAppAssocExt ".ufa"
@@ -29,7 +29,7 @@ WizardSizePercent=120
 WizardResizable=no
 
 ; Modern styling
-SetupIconFile=
+SetupIconFile=icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 DisableWelcomePage=no
 DisableDirPage=no
@@ -56,12 +56,13 @@ Name: "startupicon"; Description: "Launch at Windows startup (recommended)"; Gro
 
 [Files]
 Source: "unreal-free-assets.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Comment: "Monitor for free Unreal assets"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"; Comment: "Monitor for free Unreal assets"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; Comment: "Monitor for free Unreal assets"
-Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: startupicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon; Comment: "Monitor for free Unreal assets"
+Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"; Tasks: startupicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
