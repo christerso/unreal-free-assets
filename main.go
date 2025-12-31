@@ -331,7 +331,7 @@ func createAssetList(assets *[]Asset) *widget.List {
 			infoLabel := widget.NewLabel("Info")
 			infoLabel.TextStyle = fyne.TextStyle{Italic: true}
 
-			openBtn := widget.NewButton("Open →", func() {})
+			openBtn := widget.NewButton("Open", func() {})
 			openBtn.Importance = widget.HighImportance
 
 			left := container.NewVBox(titleLabel, infoLabel)
