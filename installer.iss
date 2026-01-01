@@ -2,7 +2,7 @@
 ; Beautiful modern installer with Unreal Engine styling
 
 #define MyAppName "Unreal Free Assets Monitor"
-#define MyAppVersion "1.0.1"
+#define MyAppVersion "1.0.2"
 #define MyAppPublisher "Christer Söderlund"
 #define MyAppExeName "unreal-free-assets.exe"
 #define MyAppAssocName MyAppName + " File"
